@@ -31,6 +31,11 @@ const CUSTOM_MAX_SECONDS: u64 = 10;
 const CUSTOM_GAP_SECONDS: f32 = 0.3;
 /// How long the fade at the cut-off point of a long custom sound lasts.
 const CUSTOM_FADE_SECONDS: f32 = 0.05;
+/// Bytes 2-15 of the sub-format GUID of WAVE_FORMAT_EXTENSIBLE audio that the
+/// standard formats (PCM, float) share; bytes 0-1 say which format it is.
+const EXTENSIBLE_GUID_TAIL: [u8; 14] = [
+    0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
 
 /// The built-in chime at `volume` (0–100), sounding `repeats` times in a row,
 /// as a 16-bit mono WAV file.
@@ -216,9 +221,15 @@ fn read_headers(file: &mut (impl Read + Seek)) -> Result<(Encoding, u64, u64), S
 fn parse_encoding(format: &[u8]) -> Result<Encoding, String> {
     let word = |at: usize| u16::from_le_bytes([format[at], format[at + 1]]);
     let mut tag = word(0);
-    // WAVE_FORMAT_EXTENSIBLE keeps the real format in the first bytes of its
-    // sub-format identifier.
-    if tag == 0xFFFE && format.len() >= 26 {
+    // WAVE_FORMAT_EXTENSIBLE keeps the real format in the first two bytes of
+    // its sub-format GUID; the rest must be the standard Microsoft ending.
+    if tag == 0xFFFE {
+        if format.len() < 40 || format[26..40] != EXTENSIBLE_GUID_TAIL {
+            return Err(
+                "the WAV file uses an unsupported extensible encoding; save it as a normal PCM .wav"
+                    .to_owned(),
+            );
+        }
         tag = word(24);
     }
     let channels = usize::from(word(2));
@@ -501,6 +512,60 @@ mod tests {
         let wav = custom("stereo", &file, 100, 1).unwrap();
         assert_eq!(word(&wav, 22), 2, "stereo");
         assert_eq!(samples_of(&wav), [100, -100, 200, -200]);
+    }
+
+    /// A WAV file with the given `fmt ` body, optionally with a `LIST` chunk
+    /// in front of it.
+    fn riff_with_fmt(fmt: &[u8], list_first: bool, audio: &[u8]) -> Vec<u8> {
+        let mut body = b"WAVE".to_vec();
+        if list_first {
+            body.extend_from_slice(b"LIST");
+            body.extend_from_slice(&4u32.to_le_bytes());
+            body.extend_from_slice(b"INFO");
+        }
+        body.extend_from_slice(b"fmt ");
+        body.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        body.extend_from_slice(fmt);
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&(audio.len() as u32).to_le_bytes());
+        body.extend_from_slice(audio);
+        let mut file = b"RIFF".to_vec();
+        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        file.extend_from_slice(&body);
+        file
+    }
+
+    /// A 40-byte WAVE_FORMAT_EXTENSIBLE `fmt ` body for 16-bit mono 8 kHz PCM.
+    fn extensible_fmt(guid_tail: [u8; 14]) -> Vec<u8> {
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&8_000u32.to_le_bytes());
+        fmt.extend_from_slice(&16_000u32.to_le_bytes());
+        fmt.extend_from_slice(&2u16.to_le_bytes());
+        fmt.extend_from_slice(&16u16.to_le_bytes());
+        fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        fmt.extend_from_slice(&16u16.to_le_bytes()); // valid bits
+        fmt.extend_from_slice(&4u32.to_le_bytes()); // channel mask
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // sub-format: PCM
+        fmt.extend_from_slice(&guid_tail);
+        fmt
+    }
+
+    #[test]
+    fn extensible_files_need_the_standard_sub_format_and_a_list_chunk_may_come_first() {
+        let audio = pcm16(&[300, -300]);
+        let good = riff_with_fmt(&extensible_fmt(EXTENSIBLE_GUID_TAIL), true, &audio);
+        assert_eq!(
+            samples_of(&custom("extensible", &good, 100, 1).unwrap()),
+            [300, -300]
+        );
+
+        let mut other = EXTENSIBLE_GUID_TAIL;
+        other[4] = 0x11;
+        let bad = riff_with_fmt(&extensible_fmt(other), false, &audio);
+        let error = custom("extensible-bad", &bad, 100, 1).unwrap_err();
+        assert!(error.contains("unsupported"), "{error}");
     }
 
     #[test]

@@ -630,6 +630,13 @@ struct TrayApp {
     notification_volume: u8,
     notification_sound_path: String,
     notification_repeat: u32,
+    // A repeat count just chosen and not yet confirmed by a snapshot, so an
+    // older snapshot does not snap the menu back; given up after a few seconds
+    // in case the save failed.
+    pending_repeat: Option<(u32, Instant)>,
+    // The custom-sound problem currently shown as the panel's error, cleared
+    // once the sound plays properly.
+    sound_problem: Option<String>,
     // While the volume slider is dragged, snapshots would snap it back to the
     // saved value; it is saved once released.
     adjusting_volume: bool,
@@ -701,6 +708,8 @@ impl TrayApp {
             notification_volume: 60,
             notification_sound_path: String::new(),
             notification_repeat: 1,
+            pending_repeat: None,
+            sound_problem: None,
             adjusting_volume: false,
             last_tick: SystemTime::now(),
             panel_requests,
@@ -761,7 +770,16 @@ impl TrayApp {
             self.automatic_updates = snapshot.automatic_updates;
             self.notification_sound = snapshot.notification_sound;
             self.notification_sound_path = snapshot.notification_sound_path.clone();
-            self.notification_repeat = snapshot.notification_repeat;
+            let pending = self.pending_repeat;
+            match pending {
+                Some((count, since))
+                    if snapshot.notification_repeat != count
+                        && since.elapsed() < Duration::from_secs(3) => {}
+                _ => {
+                    self.notification_repeat = snapshot.notification_repeat;
+                    self.pending_repeat = None;
+                }
+            }
             if !self.adjusting_volume {
                 self.notification_volume = snapshot.notification_volume;
             }
@@ -870,10 +888,18 @@ impl TrayApp {
                 self.notification_repeat,
                 &self.notification_sound_path,
             ) {
-                Ok(None) => {}
+                Ok(None) => {
+                    // The sound plays properly now: drop the warning it left.
+                    if let Some(old) = self.sound_problem.take()
+                        && self.last_error.as_deref() == Some(old.as_str())
+                    {
+                        self.last_error = None;
+                    }
+                }
                 Ok(Some(problem)) => {
                     // The built-in chime played instead; say why on the panel.
                     tracing::warn!(%problem, "Could not use the custom notification sound");
+                    self.sound_problem = Some(problem.clone());
                     self.last_error = Some(problem);
                 }
                 Err(error) => tracing::warn!(%error, "Could not play the notification sound"),
@@ -1426,6 +1452,7 @@ impl TrayApp {
                         )
                     {
                         self.notification_repeat = repeat;
+                        self.pending_repeat = Some((repeat, Instant::now()));
                     }
                     divider(ui);
                     let mut test = false;
